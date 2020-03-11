@@ -6,16 +6,17 @@ from django.db import transaction
 from django.db.models import Q
 from django.template.defaultfilters import slugify
 
+from ....core.permissions import ProductPermissions
 from ....product import AttributeInputType, models
-from ...core.mutations import (
-    BaseMutation,
-    ClearMetaBaseMutation,
-    ModelDeleteMutation,
-    ModelMutation,
-    UpdateMetaBaseMutation,
+from ....product.error_codes import ProductErrorCode
+from ...core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
+from ...core.types.common import ProductError
+from ...core.utils import (
+    from_global_id_strict_type,
+    validate_slug_and_generate_if_needed,
 )
-from ...core.utils import from_global_id_strict_type
 from ...core.utils.reordering import perform_reordering
+from ...meta.deprecated.mutations import ClearMetaBaseMutation, UpdateMetaBaseMutation
 from ...product.types import ProductType
 from ..descriptions import AttributeDescriptions, AttributeValueDescriptions
 from ..enums import AttributeInputTypeEnum, AttributeTypeEnum
@@ -24,10 +25,6 @@ from ..types import Attribute, AttributeValue
 
 class AttributeValueCreateInput(graphene.InputObjectType):
     name = graphene.String(required=True, description=AttributeValueDescriptions.NAME)
-    value = graphene.String(
-        description=AttributeValueDescriptions.VALUE,
-        deprecation_reason="This field is depracated",
-    )
 
 
 class AttributeCreateInput(graphene.InputObjectType):
@@ -93,17 +90,17 @@ class AttributeUpdateInput(graphene.InputObjectType):
 
 
 class AttributeAssignInput(graphene.InputObjectType):
-    id = graphene.ID(required=True, description="The ID of the attribute to assign")
+    id = graphene.ID(required=True, description="The ID of the attribute to assign.")
     type = AttributeTypeEnum(
         required=True, description="The attribute type to be assigned as."
     )
 
 
 class ReorderInput(graphene.InputObjectType):
-    id = graphene.ID(required=True, description="The ID of the item to move")
+    id = graphene.ID(required=True, description="The ID of the item to move.")
     sort_order = graphene.Int(
         description=(
-            "The new relative sorting position of the item (from -inf to +inf)"
+            "The new relative sorting position of the item (from -inf to +inf)."
         )
     )
 
@@ -120,12 +117,22 @@ class AttributeMixin:
                     "Value %s already exists within this attribute."
                     % value_data["name"]
                 )
-                raise ValidationError({cls.ATTRIBUTE_VALUES_FIELD: msg})
+                raise ValidationError(
+                    {
+                        cls.ATTRIBUTE_VALUES_FIELD: ValidationError(
+                            msg, code=ProductErrorCode.ALREADY_EXISTS
+                        )
+                    }
+                )
 
         new_slugs = [slugify(value_data["name"]) for value_data in values_input]
         if len(set(new_slugs)) != len(new_slugs):
             raise ValidationError(
-                {cls.ATTRIBUTE_VALUES_FIELD: "Provided values are not unique."}
+                {
+                    cls.ATTRIBUTE_VALUES_FIELD: ValidationError(
+                        "Provided values are not unique.", code=ProductErrorCode.UNIQUE
+                    )
+                }
             )
 
     @classmethod
@@ -147,28 +154,21 @@ class AttributeMixin:
             try:
                 attribute_value.full_clean()
             except ValidationError as validation_errors:
-                for field in validation_errors.message_dict:
+                for field, err in validation_errors.error_dict.items():
                     if field == "attribute":
                         continue
-                    for msg in validation_errors.message_dict[field]:
-                        raise ValidationError({cls.ATTRIBUTE_VALUES_FIELD: msg})
+                    raise ValidationError({cls.ATTRIBUTE_VALUES_FIELD: err})
         cls.check_values_are_unique(values_input, attribute)
 
     @classmethod
     def clean_attribute(cls, instance, cleaned_input):
-        input_slug = cleaned_input.get("slug", None)
-        if input_slug is None:
-            cleaned_input["slug"] = slugify(cleaned_input["name"])
-        elif input_slug == "":
-            raise ValidationError({"slug": "The attribute's slug cannot be blank."})
-
-        query = models.Attribute.objects.filter(slug=cleaned_input["slug"])
-
-        if instance.pk:
-            query = query.exclude(pk=instance.pk)
-
-        if query.exists():
-            raise ValidationError({"slug": "This attribute's slug already exists."})
+        try:
+            cleaned_input = validate_slug_and_generate_if_needed(
+                instance, "name", cleaned_input
+            )
+        except ValidationError as error:
+            error.code = ProductErrorCode.REQUIRED.value
+            raise ValidationError({"slug": error})
 
         return cleaned_input
 
@@ -195,7 +195,9 @@ class AttributeCreate(AttributeMixin, ModelMutation):
     class Meta:
         model = models.Attribute
         description = "Creates an attribute."
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -208,7 +210,7 @@ class AttributeCreate(AttributeMixin, ModelMutation):
 
         # Construct the attribute
         instance = cls.construct_instance(instance, cleaned_input)
-        cls.clean_instance(instance)
+        cls.clean_instance(info, instance)
 
         # Commit it
         instance.save()
@@ -234,7 +236,9 @@ class AttributeUpdate(AttributeMixin, ModelMutation):
     class Meta:
         model = models.Attribute
         description = "Updates attribute."
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
     def clean_remove_values(cls, cleaned_input, instance):
@@ -243,7 +247,13 @@ class AttributeUpdate(AttributeMixin, ModelMutation):
         for value in remove_values:
             if value.attribute != instance:
                 msg = "Value %s does not belong to this attribute." % value
-                raise ValidationError({"remove_values": msg})
+                raise ValidationError(
+                    {
+                        "remove_values": ValidationError(
+                            msg, code=ProductErrorCode.INVALID
+                        )
+                    }
+                )
         return remove_values
 
     @classmethod
@@ -264,7 +274,7 @@ class AttributeUpdate(AttributeMixin, ModelMutation):
 
         # Construct the attribute
         instance = cls.construct_instance(instance, cleaned_input)
-        cls.clean_instance(instance)
+        cls.clean_instance(info, instance)
 
         # Commit it
         instance.save()
@@ -290,10 +300,12 @@ class AttributeAssign(BaseMutation):
 
     class Meta:
         description = "Assign attributes to a given product type."
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
-    def check_permissions(cls, user):
-        return user.has_perm("product.manage_products")
+    def check_permissions(cls, context):
+        return context.user.has_perm(ProductPermissions.MANAGE_PRODUCTS)
 
     @classmethod
     def get_operations(cls, info, operations: List[AttributeAssignInput]):
@@ -303,7 +315,7 @@ class AttributeAssign(BaseMutation):
 
         for operation in operations:
             pk = from_global_id_strict_type(
-                info, operation.id, only_type=Attribute, field="operations"
+                operation.id, only_type=Attribute, field="operations"
             )
             if operation.type == AttributeTypeEnum.PRODUCT:
                 product_attrs_pks.append(pk)
@@ -327,8 +339,9 @@ class AttributeAssign(BaseMutation):
             msg = ", ".join([f"{name} ({slug})" for name, slug in invalid_attributes])
             raise ValidationError(
                 {
-                    "operations": (
-                        f"{msg} have already been assigned to this product type."
+                    "operations": ValidationError(
+                        (f"{msg} have already been assigned to this product type."),
+                        code=ProductErrorCode.ATTRIBUTE_ALREADY_ASSIGNED,
                     )
                 }
             )
@@ -342,10 +355,13 @@ class AttributeAssign(BaseMutation):
         if is_not_assignable_to_variant:
             raise ValidationError(
                 {
-                    "operations": (
-                        f"Attributes having for input types "
-                        f"{AttributeInputType.NON_ASSIGNABLE_TO_VARIANTS} "
-                        f"cannot be assigned as variant attributes"
+                    "operations": ValidationError(
+                        (
+                            f"Attributes having for input types "
+                            f"{AttributeInputType.NON_ASSIGNABLE_TO_VARIANTS} "
+                            f"cannot be assigned as variant attributes"
+                        ),
+                        code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED,
                     )
                 }
             )
@@ -358,7 +374,12 @@ class AttributeAssign(BaseMutation):
 
         if contains_restricted_attributes:
             raise ValidationError(
-                {"operations": ("Cannot assign variant only attributes.")}
+                {
+                    "operations": ValidationError(
+                        "Cannot assign variant only attributes.",
+                        code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED,
+                    )
+                }
             )
 
     @classmethod
@@ -378,20 +399,25 @@ class AttributeAssign(BaseMutation):
 
     @classmethod
     @transaction.atomic()
-    def perform_mutation(
-        cls, _root, info, product_type_id: str, operations: List[AttributeAssignInput]
-    ):
+    def perform_mutation(cls, _root, info, **data):
+        product_type_id: str = data["product_type_id"]
+        operations: List[AttributeAssignInput] = data["operations"]
         # Retrieve the requested product type
-        product_type = graphene.Node.get_node_from_global_id(
+        product_type: models.ProductType = graphene.Node.get_node_from_global_id(
             info, product_type_id, only_type=ProductType
-        )  # type: models.ProductType
+        )
 
         # Resolve all the passed IDs to ints
         product_attrs_pks, variant_attrs_pks = cls.get_operations(info, operations)
 
         if variant_attrs_pks and not product_type.has_variants:
             raise ValidationError(
-                {"operations": "Variants are disabled in this product type."}
+                {
+                    "operations": ValidationError(
+                        "Variants are disabled in this product type.",
+                        code=ProductErrorCode.ATTRIBUTE_VARIANTS_DISABLED.value,
+                    )
+                }
             )
 
         # Ensure the attribute are assignable
@@ -415,15 +441,17 @@ class AttributeUnassign(BaseMutation):
         attribute_ids = graphene.List(
             graphene.ID,
             required=True,
-            description="The IDs of the attributes to assign",
+            description="The IDs of the attributes to assign.",
         )
 
     class Meta:
         description = "Un-assign attributes from a given product type."
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
-    def check_permissions(cls, user):
-        return user.has_perm("product.manage_products")
+    def check_permissions(cls, context):
+        return context.user.has_perm(ProductPermissions.MANAGE_PRODUCTS)
 
     @classmethod
     def save_field_values(cls, product_type, field, pks):
@@ -431,9 +459,9 @@ class AttributeUnassign(BaseMutation):
         getattr(product_type, field).remove(*pks)
 
     @classmethod
-    def perform_mutation(
-        cls, _root, info, product_type_id: str, attribute_ids: List[str]
-    ):
+    def perform_mutation(cls, _root, info, **data):
+        product_type_id: str = data["product_type_id"]
+        attribute_ids: List[str] = data["attribute_ids"]
         # Retrieve the requested product type
         product_type = graphene.Node.get_node_from_global_id(
             info, product_type_id, only_type=ProductType
@@ -442,7 +470,7 @@ class AttributeUnassign(BaseMutation):
         # Resolve all the passed IDs to ints
         attribute_pks = [
             from_global_id_strict_type(
-                info, attribute_id, only_type=Attribute, field="attribute_id"
+                attribute_id, only_type=Attribute, field="attribute_id"
             )
             for attribute_id in attribute_ids
         ]
@@ -461,46 +489,63 @@ class AttributeDelete(ModelDeleteMutation):
     class Meta:
         model = models.Attribute
         description = "Deletes an attribute."
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
 
 class AttributeUpdateMeta(UpdateMetaBaseMutation):
     class Meta:
         model = models.Attribute
-        description = "Update public metadata for Attribute "
-        permissions = ("product.manage_products",)
+        description = "Update public metadata for attribute."
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
         public = True
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
 
 class AttributeClearMeta(ClearMetaBaseMutation):
     class Meta:
-        description = "Clears public metadata item for Attribute"
+        description = "Clears public metadata item for attribute."
         model = models.Attribute
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
         public = True
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
 
 class AttributeUpdatePrivateMeta(UpdateMetaBaseMutation):
     class Meta:
-        description = "Update public metadata for Attribute"
+        description = "Update public metadata for attribute."
         model = models.Attribute
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
         public = False
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
 
 class AttributeClearPrivateMeta(ClearMetaBaseMutation):
     class Meta:
-        description = "Clears public metadata item for Attribute"
+        description = "Clears public metadata item for attribute."
         model = models.Attribute
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
         public = False
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
 
 def validate_value_is_unique(attribute: models.Attribute, value: models.AttributeValue):
     """Check if the attribute value is unique within the attribute it belongs to."""
     duplicated_values = attribute.values.exclude(pk=value.pk).filter(slug=value.slug)
     if duplicated_values.exists():
-        raise ValidationError({"name": f"Value with slug {value.slug} already exists."})
+        raise ValidationError(
+            {
+                "name": ValidationError(
+                    f"Value with slug {value.slug} already exists.",
+                    code=ProductErrorCode.ALREADY_EXISTS.value,
+                )
+            }
+        )
 
 
 class AttributeValueCreate(ModelMutation):
@@ -519,7 +564,9 @@ class AttributeValueCreate(ModelMutation):
     class Meta:
         model = models.AttributeValue
         description = "Creates a value for an attribute."
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
     def clean_input(cls, info, instance, data):
@@ -528,18 +575,17 @@ class AttributeValueCreate(ModelMutation):
         return cleaned_input
 
     @classmethod
-    def clean_instance(cls, instance):
+    def clean_instance(cls, info, instance):
         validate_value_is_unique(instance.attribute, instance)
-        super().clean_instance(instance)
+        super().clean_instance(info, instance)
 
     @classmethod
     def perform_mutation(cls, _root, info, attribute_id, input):
         attribute = cls.get_node_or_error(info, attribute_id, only_type=Attribute)
-
         instance = models.AttributeValue(attribute=attribute)
         cleaned_input = cls.clean_input(info, instance, input)
         instance = cls.construct_instance(instance, cleaned_input)
-        cls.clean_instance(instance)
+        cls.clean_instance(info, instance)
 
         instance.save()
         cls._save_m2m(info, instance, cleaned_input)
@@ -560,7 +606,9 @@ class AttributeValueUpdate(ModelMutation):
     class Meta:
         model = models.AttributeValue
         description = "Updates value of an attribute."
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
     def clean_input(cls, info, instance, data):
@@ -570,9 +618,9 @@ class AttributeValueUpdate(ModelMutation):
         return cleaned_input
 
     @classmethod
-    def clean_instance(cls, instance):
+    def clean_instance(cls, info, instance):
         validate_value_is_unique(instance.attribute, instance)
-        super().clean_instance(instance)
+        super().clean_instance(info, instance)
 
     @classmethod
     def success_response(cls, instance):
@@ -590,7 +638,9 @@ class AttributeValueDelete(ModelDeleteMutation):
     class Meta:
         model = models.AttributeValue
         description = "Deletes a value of an attribute."
-        permissions = ("product.manage_products",)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     @classmethod
     def success_response(cls, instance):
@@ -605,8 +655,10 @@ class ProductTypeReorderAttributes(BaseMutation):
     )
 
     class Meta:
-        description = "Reorder the attributes of a product type"
-        permissions = ("product.manage_products",)
+        description = "Reorder the attributes of a product type."
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     class Arguments:
         product_type_id = graphene.Argument(
@@ -624,7 +676,7 @@ class ProductTypeReorderAttributes(BaseMutation):
     @classmethod
     def perform_mutation(cls, _root, info, product_type_id, type, moves):
         pk = from_global_id_strict_type(
-            info, product_type_id, only_type=ProductType, field="product_type_id"
+            product_type_id, only_type=ProductType, field="product_type_id"
         )
 
         if type == AttributeTypeEnum.PRODUCT:
@@ -639,8 +691,9 @@ class ProductTypeReorderAttributes(BaseMutation):
         except ObjectDoesNotExist:
             raise ValidationError(
                 {
-                    "product_type_id": (
-                        f"Couldn't resolve to a product type: {product_type_id}"
+                    "product_type_id": ValidationError(
+                        (f"Couldn't resolve to a product type: {product_type_id}"),
+                        code=ProductErrorCode.NOT_FOUND,
                     )
                 }
             )
@@ -651,14 +704,19 @@ class ProductTypeReorderAttributes(BaseMutation):
         # Resolve the attributes
         for move_info in moves:
             attribute_pk = from_global_id_strict_type(
-                info, move_info.id, only_type=Attribute, field="moves"
+                move_info.id, only_type=Attribute, field="moves"
             )
 
             try:
                 m2m_info = attributes_m2m.get(attribute_id=int(attribute_pk))
             except ObjectDoesNotExist:
                 raise ValidationError(
-                    {"moves": f"Couldn't resolve to an attribute: {move_info.id}"}
+                    {
+                        "moves": ValidationError(
+                            f"Couldn't resolve to an attribute: {move_info.id}",
+                            code=ProductErrorCode.NOT_FOUND,
+                        )
+                    }
                 )
             operations[m2m_info.pk] = move_info.sort_order
 
@@ -673,8 +731,10 @@ class AttributeReorderValues(BaseMutation):
     )
 
     class Meta:
-        description = "Reorder the values of an attribute"
-        permissions = ("product.manage_products",)
+        description = "Reorder the values of an attribute."
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
 
     class Arguments:
         attribute_id = graphene.Argument(
@@ -689,14 +749,19 @@ class AttributeReorderValues(BaseMutation):
     @classmethod
     def perform_mutation(cls, _root, info, attribute_id, moves):
         pk = from_global_id_strict_type(
-            info, attribute_id, only_type=Attribute, field="attribute_id"
+            attribute_id, only_type=Attribute, field="attribute_id"
         )
 
         try:
             attribute = models.Attribute.objects.prefetch_related("values").get(pk=pk)
         except ObjectDoesNotExist:
             raise ValidationError(
-                {"attribute_id": (f"Couldn't resolve to an attribute: {attribute_id}")}
+                {
+                    "attribute_id": ValidationError(
+                        f"Couldn't resolve to an attribute: {attribute_id}",
+                        code=ProductErrorCode.NOT_FOUND,
+                    )
+                }
             )
 
         values_m2m = attribute.values
@@ -705,14 +770,19 @@ class AttributeReorderValues(BaseMutation):
         # Resolve the values
         for move_info in moves:
             value_pk = from_global_id_strict_type(
-                info, move_info.id, only_type=AttributeValue, field="moves"
+                move_info.id, only_type=AttributeValue, field="moves"
             )
 
             try:
                 m2m_info = values_m2m.get(pk=int(value_pk))
             except ObjectDoesNotExist:
                 raise ValidationError(
-                    {"moves": f"Couldn't resolve to an attribute value: {move_info.id}"}
+                    {
+                        "moves": ValidationError(
+                            f"Couldn't resolve to an attribute value: {move_info.id}",
+                            code=ProductErrorCode.NOT_FOUND,
+                        )
+                    }
                 )
             operations[m2m_info.pk] = move_info.sort_order
 

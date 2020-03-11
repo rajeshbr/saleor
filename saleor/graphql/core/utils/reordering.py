@@ -1,7 +1,6 @@
-import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from django.db import transaction
 from django.db.models import F, QuerySet
@@ -30,11 +29,11 @@ class Reordering:
         # Will contain the original data, before sorting
         # This will be useful to look for the sort orders that
         # actually were changed
-        self.old_sort_map = {}
+        self.old_sort_map: Dict[int, str] = {}
 
         # Will contain the list of keys kept
         # in correct order in accordance to their sort order
-        self.ordered_pks = []
+        self.ordered_pks: List[int] = []
 
     @cached_property
     def ordered_node_map(self):
@@ -90,11 +89,9 @@ class Reordering:
 
         # Skip if noting to do
         if move == 0:
-            warnings.warn(
-                f"Ignored node's reordering, did not find: {pk} "
-                f"(from {self.qs.model.__name__})"
-            )
             return
+        if move is None:
+            move = +1
 
         node_pos, target_pos, new_sort_order = self.calculate_new_sort_order(pk, move)
 

@@ -1,47 +1,51 @@
 import graphene
 
+from ...core.permissions import ExtensionsPermissions
 from ...extensions.manager import get_extensions_manager
 from ..core.mutations import BaseMutation
-from .types import PluginConfiguration
+from ..core.types.common import ExtensionsError
+from .types import Plugin
 
 
 class ConfigurationItemInput(graphene.InputObjectType):
-    name = graphene.String(required=True, description="Name of the field to update")
+    name = graphene.String(required=True, description="Name of the field to update.")
     value = graphene.String(
-        required=True, description="Value of the given field to update"
+        required=False, description="Value of the given field to update."
     )
 
 
-class PluginConfigurationUpdateInput(graphene.InputObjectType):
+class PluginUpdateInput(graphene.InputObjectType):
     active = graphene.Boolean(
-        required=False, description="Indicates whether the plugin should be enabled"
+        required=False, description="Indicates whether the plugin should be enabled."
     )
     configuration = graphene.List(
         ConfigurationItemInput,
         required=False,
-        description="Configuration of the plugin",
+        description="Configuration of the plugin.",
     )
 
 
-class PluginConfigurationUpdate(BaseMutation):
-    plugin_configuration = graphene.Field(PluginConfiguration)
+class PluginUpdate(BaseMutation):
+    plugin = graphene.Field(Plugin)
 
     class Arguments:
-        id = graphene.ID(required=True, description="ID of plugin to update")
-        input = PluginConfigurationUpdateInput(
+        id = graphene.ID(required=True, description="ID of plugin to update.")
+        input = PluginUpdateInput(
             description="Fields required to update a plugin configuration.",
             required=True,
         )
 
     class Meta:
-        description = "Update plugin configuration"
-        permissions = "extensions.manage_plugins"
+        description = "Update plugin configuration."
+        permissions = (ExtensionsPermissions.MANAGE_PLUGINS,)
+        error_type_class = ExtensionsError
+        error_type_field = "extensions_errors"
 
     @classmethod
     def perform_mutation(cls, root, info, **data):
         plugin_id = data.get("id")
         input = data.get("input")
-        instance = cls.get_node_or_error(info, plugin_id, only_type=PluginConfiguration)
+        instance = cls.get_node_or_error(info, plugin_id, only_type=Plugin)
         manager = get_extensions_manager()
         instance = manager.save_plugin_configuration(instance.name, input)
-        return PluginConfigurationUpdate(plugin_configuration=instance)
+        return PluginUpdate(plugin=instance)

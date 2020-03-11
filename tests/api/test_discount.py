@@ -159,7 +159,7 @@ mutation  voucherCreate(
             }
             voucher {
                 type
-                minAmountSpent {
+                minSpent {
                     amount
                 }
                 minCheckoutItemsQuantity
@@ -200,7 +200,7 @@ def test_create_voucher(staff_api_client, permission_manage_discounts):
     get_graphql_content(response)
     voucher = Voucher.objects.get()
     assert voucher.type == VoucherType.ENTIRE_ORDER
-    assert voucher.min_amount_spent.amount == Decimal("1.12")
+    assert voucher.min_spent_amount == Decimal("1.12")
     assert voucher.name == "test voucher"
     assert voucher.code == "testcode123"
     assert voucher.discount_value_type == DiscountValueType.FIXED
@@ -220,7 +220,7 @@ def test_create_voucher_with_empty_code(staff_api_client, permission_manage_disc
         "code": "",
         "discountValueType": DiscountValueTypeEnum.FIXED.name,
         "discountValue": 10.12,
-        "minAmountSpent": 1.12,
+        "minSpent": 1.12,
         "startDate": start_date.isoformat(),
         "endDate": end_date.isoformat(),
         "usageLimit": None,
@@ -233,33 +233,6 @@ def test_create_voucher_with_empty_code(staff_api_client, permission_manage_disc
     data = content["data"]["voucherCreate"]["voucher"]
     assert data["name"] == variables["name"]
     assert data["code"] != ""
-
-
-def test_create_voucher_with_deprecated_type(
-    staff_api_client, permission_manage_discounts
-):
-    start_date = timezone.now() - timedelta(days=365)
-    end_date = timezone.now() + timedelta(days=365)
-    variables = {
-        "name": "test voucher",
-        "type": VoucherTypeEnum.VALUE.name,
-        "code": "",
-        "discountValueType": DiscountValueTypeEnum.FIXED.name,
-        "discountValue": 10.12,
-        "minAmountSpent": 1.12,
-        "startDate": start_date.isoformat(),
-        "endDate": end_date.isoformat(),
-        "usageLimit": 0,
-    }
-
-    response = staff_api_client.post_graphql(
-        CREATE_VOUCHER_MUTATION, variables, permissions=[permission_manage_discounts]
-    )
-    content = get_graphql_content(response)
-    data = content["data"]["voucherCreate"]["voucher"]
-    assert data["name"] == variables["name"]
-    assert data["code"] != ""
-    assert data["type"] == VoucherTypeEnum.ENTIRE_ORDER.name
 
 
 def test_create_voucher_with_existing_gift_card_code(
@@ -983,6 +956,126 @@ def test_query_vouchers_with_filter_search(
     assert len(data) == count
 
 
+QUERY_VOUCHER_WITH_SORT = """
+    query ($sort_by: VoucherSortingInput!) {
+        vouchers(first:5, sortBy: $sort_by) {
+            edges{
+                node{
+                    name
+                }
+            }
+        }
+    }
+"""
+
+
+@pytest.mark.parametrize(
+    "voucher_sort, result_order",
+    [
+        (
+            {"field": "CODE", "direction": "ASC"},
+            ["Voucher2", "Voucher1", "FreeShipping"],
+        ),
+        (
+            {"field": "CODE", "direction": "DESC"},
+            ["FreeShipping", "Voucher1", "Voucher2"],
+        ),
+        (
+            {"field": "VALUE", "direction": "ASC"},
+            ["Voucher2", "FreeShipping", "Voucher1"],
+        ),
+        (
+            {"field": "VALUE", "direction": "DESC"},
+            ["Voucher1", "FreeShipping", "Voucher2"],
+        ),
+        (
+            {"field": "TYPE", "direction": "ASC"},
+            ["Voucher1", "Voucher2", "FreeShipping"],
+        ),
+        (
+            {"field": "TYPE", "direction": "DESC"},
+            ["FreeShipping", "Voucher1", "Voucher2"],
+        ),
+        (
+            {"field": "START_DATE", "direction": "ASC"},
+            ["FreeShipping", "Voucher2", "Voucher1"],
+        ),
+        (
+            {"field": "START_DATE", "direction": "DESC"},
+            ["Voucher1", "Voucher2", "FreeShipping"],
+        ),
+        (
+            {"field": "END_DATE", "direction": "ASC"},
+            ["Voucher2", "FreeShipping", "Voucher1"],
+        ),
+        (
+            {"field": "END_DATE", "direction": "DESC"},
+            ["Voucher1", "FreeShipping", "Voucher2"],
+        ),
+        (
+            {"field": "USAGE_LIMIT", "direction": "ASC"},
+            ["Voucher1", "FreeShipping", "Voucher2"],
+        ),
+        (
+            {"field": "USAGE_LIMIT", "direction": "DESC"},
+            ["Voucher2", "FreeShipping", "Voucher1"],
+        ),
+        (
+            {"field": "MINIMUM_SPENT_AMOUNT", "direction": "ASC"},
+            ["Voucher2", "FreeShipping", "Voucher1"],
+        ),
+        (
+            {"field": "MINIMUM_SPENT_AMOUNT", "direction": "DESC"},
+            ["Voucher1", "FreeShipping", "Voucher2"],
+        ),
+    ],
+)
+def test_query_vouchers_with_sort(
+    voucher_sort, result_order, staff_api_client, permission_manage_discounts
+):
+    Voucher.objects.bulk_create(
+        [
+            Voucher(
+                name="Voucher1",
+                discount_value=123,
+                code="abc",
+                discount_value_type=DiscountValueType.FIXED,
+                type=VoucherType.ENTIRE_ORDER,
+                usage_limit=10,
+            ),
+            Voucher(
+                name="Voucher2",
+                discount_value=23,
+                code="123",
+                discount_value_type=DiscountValueType.FIXED,
+                type=VoucherType.ENTIRE_ORDER,
+                start_date=timezone.now().replace(year=2012, month=1, day=5),
+                end_date=timezone.now().replace(year=2013, month=1, day=5),
+                min_spent_amount=50,
+            ),
+            Voucher(
+                name="FreeShipping",
+                discount_value=100,
+                code="xyz",
+                discount_value_type=DiscountValueType.PERCENTAGE,
+                type=VoucherType.SHIPPING,
+                start_date=timezone.now().replace(year=2011, month=1, day=5),
+                end_date=timezone.now().replace(year=2015, month=12, day=31),
+                usage_limit=1000,
+                min_spent_amount=500,
+            ),
+        ]
+    )
+    variables = {"sort_by": voucher_sort}
+    staff_api_client.user.user_permissions.add(permission_manage_discounts)
+    response = staff_api_client.post_graphql(QUERY_VOUCHER_WITH_SORT, variables)
+    content = get_graphql_content(response)
+    vouchers = content["data"]["vouchers"]["edges"]
+
+    for order, voucher_name in enumerate(result_order):
+        assert vouchers[order]["node"]["name"] == voucher_name
+
+
 @pytest.mark.parametrize(
     "sale_filter, start_date, end_date, count",
     [
@@ -1138,3 +1231,63 @@ def test_query_sales_with_filter_search(
     content = get_graphql_content(response)
     data = content["data"]["sales"]["edges"]
     assert len(data) == count
+
+
+QUERY_SALE_WITH_SORT = """
+    query ($sort_by: SaleSortingInput!) {
+        sales(first:5, sortBy: $sort_by) {
+            edges{
+                node{
+                    name
+                }
+            }
+        }
+    }
+"""
+
+
+@pytest.mark.parametrize(
+    "sale_sort, result_order",
+    [
+        ({"field": "NAME", "direction": "ASC"}, ["BigSale", "Sale2", "Sale3"]),
+        ({"field": "NAME", "direction": "DESC"}, ["Sale3", "Sale2", "BigSale"]),
+        ({"field": "VALUE", "direction": "ASC"}, ["Sale3", "Sale2", "BigSale"]),
+        ({"field": "VALUE", "direction": "DESC"}, ["BigSale", "Sale2", "Sale3"]),
+        ({"field": "TYPE", "direction": "ASC"}, ["Sale2", "Sale3", "BigSale"]),
+        ({"field": "TYPE", "direction": "DESC"}, ["BigSale", "Sale2", "Sale3"]),
+        ({"field": "START_DATE", "direction": "ASC"}, ["Sale3", "Sale2", "BigSale"]),
+        ({"field": "START_DATE", "direction": "DESC"}, ["BigSale", "Sale2", "Sale3"]),
+        ({"field": "END_DATE", "direction": "ASC"}, ["Sale2", "Sale3", "BigSale"]),
+        ({"field": "END_DATE", "direction": "DESC"}, ["BigSale", "Sale3", "Sale2"]),
+    ],
+)
+def test_query_sales_with_sort(
+    sale_sort, result_order, staff_api_client, permission_manage_discounts
+):
+    Sale.objects.bulk_create(
+        [
+            Sale(name="BigSale", value=1234, type="PERCENTAGE"),
+            Sale(
+                name="Sale2",
+                value=123,
+                type="FIXED",
+                start_date=timezone.now().replace(year=2012, month=1, day=5),
+                end_date=timezone.now().replace(year=2013, month=1, day=5),
+            ),
+            Sale(
+                name="Sale3",
+                value=69,
+                type="FIXED",
+                start_date=timezone.now().replace(year=2011, month=1, day=5),
+                end_date=timezone.now().replace(year=2015, month=12, day=31),
+            ),
+        ]
+    )
+    variables = {"sort_by": sale_sort}
+    staff_api_client.user.user_permissions.add(permission_manage_discounts)
+    response = staff_api_client.post_graphql(QUERY_SALE_WITH_SORT, variables)
+    content = get_graphql_content(response)
+    sales = content["data"]["sales"]["edges"]
+
+    for order, sale_name in enumerate(result_order):
+        assert sales[order]["node"]["name"] == sale_name

@@ -1,8 +1,7 @@
 import pytest
-from django.conf import settings
 from graphene import Node
-from prices import TaxedMoney
 
+from saleor.checkout import calculations
 from saleor.checkout.utils import add_variant_to_checkout
 from saleor.payment import ChargeStatus, TransactionKind
 from saleor.payment.models import Payment
@@ -10,7 +9,8 @@ from tests.api.utils import get_graphql_content
 
 
 @pytest.fixture()
-def checkout_with_variant(checkout, variant):
+def checkout_with_variant(checkout, stock):
+    variant = stock.product_variant
     add_variant_to_checkout(checkout, variant, 1)
     checkout.save()
     return checkout
@@ -40,13 +40,9 @@ def checkout_with_billing_address(checkout_with_shipping_method, address):
 def checkout_with_charged_payment(checkout_with_billing_address):
     checkout = checkout_with_billing_address
 
-    total = checkout.get_total()
-    taxed_total = TaxedMoney(total, total)
+    taxed_total = calculations.checkout_total(checkout)
     payment = Payment.objects.create(
-        gateway=settings.DUMMY,
-        is_active=True,
-        total=taxed_total.gross.amount,
-        currency="USD",
+        gateway="Dummy", is_active=True, total=taxed_total.gross.amount, currency="USD"
     )
 
     payment.charge_status = ChargeStatus.FULLY_CHARGED
@@ -79,10 +75,35 @@ def test_create_checkout(api_client, graphql_address_data, variant, count_querie
         fragment ProductVariant on ProductVariant {
           id
           name
-          price {
-            amount
-            currency
-            localized
+          pricing {
+            discountLocalCurrency {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            price {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            priceUndiscounted {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            priceLocalCurrency {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
           }
           product {
             id
@@ -104,7 +125,6 @@ def test_create_checkout(api_client, graphql_address_data, variant, count_querie
             ...Price
           }
           variant {
-            stockQuantity
             ...ProductVariant
           }
           quantity
@@ -138,7 +158,6 @@ def test_create_checkout(api_client, graphql_address_data, variant, count_querie
         }
 
         fragment Checkout on Checkout {
-          availablePaymentGateways
           token
           id
           user {
@@ -220,10 +239,35 @@ def test_add_shipping_to_checkout(
         fragment ProductVariant on ProductVariant {
           id
           name
-          price {
-            amount
-            currency
-            localized
+          pricing {
+            discountLocalCurrency {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            price {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            priceUndiscounted {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            priceLocalCurrency {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
           }
           product {
             id
@@ -245,7 +289,6 @@ def test_add_shipping_to_checkout(
             ...Price
           }
           variant {
-            stockQuantity
             ...ProductVariant
           }
           quantity
@@ -279,7 +322,6 @@ def test_add_shipping_to_checkout(
         }
 
         fragment Checkout on Checkout {
-          availablePaymentGateways
           token
           id
           user {
@@ -354,10 +396,35 @@ def test_add_billing_address_to_checkout(
         fragment ProductVariant on ProductVariant {
           id
           name
-          price {
-            amount
-            currency
-            localized
+          pricing {
+            discountLocalCurrency {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            price {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            priceUndiscounted {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
+            priceLocalCurrency {
+              currency
+              gross {
+                amount
+                localized
+              }
+            }
           }
           product {
             id
@@ -379,7 +446,6 @@ def test_add_billing_address_to_checkout(
             ...Price
           }
           variant {
-            stockQuantity
             ...ProductVariant
           }
           quantity
@@ -413,12 +479,8 @@ def test_add_billing_address_to_checkout(
         }
 
         fragment Checkout on Checkout {
-          availablePaymentGateways
           token
           id
-          user {
-            email
-          }
           totalPrice {
             ...Price
           }
@@ -490,9 +552,8 @@ def test_checkout_payment_charge(
     variables = {
         "checkoutId": Node.to_global_id("Checkout", checkout_with_billing_address.pk),
         "input": {
-            "billingAddress": graphql_address_data,
             "amount": 1000,  # 10.00 USD * 100
-            "gateway": settings.DUMMY.upper(),
+            "gateway": "Dummy",
             "token": "charged",
         },
     }
@@ -503,8 +564,8 @@ def test_checkout_payment_charge(
 @pytest.mark.count_queries(autouse=False)
 def test_complete_checkout(api_client, checkout_with_charged_payment, count_queries):
     query = """
-        mutation completeCheckout($checkoutId: ID!) {
-          checkoutComplete(checkoutId: $checkoutId) {
+        mutation completeCheckout($checkoutId: ID!, $redirectUrl: String) {
+          checkoutComplete(checkoutId: $checkoutId, redirectUrl: $redirectUrl) {
             errors {
               field
               message
@@ -518,7 +579,8 @@ def test_complete_checkout(api_client, checkout_with_charged_payment, count_quer
     """
 
     variables = {
-        "checkoutId": Node.to_global_id("Checkout", checkout_with_charged_payment.pk)
+        "checkoutId": Node.to_global_id("Checkout", checkout_with_charged_payment.pk),
+        "redirectUrl": "https://www.example.com",
     }
 
     get_graphql_content(api_client.post_graphql(query, variables))

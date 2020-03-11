@@ -2,35 +2,28 @@ import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphene import relay
 
+from ...core.permissions import ProductPermissions
 from ...shipping import models
 from ..core.connection import CountableDjangoObjectType
 from ..core.types import CountryDisplay, MoneyRange
-from ..translations.enums import LanguageCodeEnum
-from ..translations.resolvers import resolve_translation
+from ..decorators import permission_required
+from ..translations.fields import TranslationField
 from ..translations.types import ShippingMethodTranslation
 from .enums import ShippingMethodTypeEnum
+from ..warehouse.types import Warehouse
 
 
 class ShippingMethod(CountableDjangoObjectType):
     type = ShippingMethodTypeEnum(description="Type of the shipping method.")
-    translation = graphene.Field(
-        ShippingMethodTranslation,
-        language_code=graphene.Argument(
-            LanguageCodeEnum,
-            description="A language code to return the translation for.",
-            required=True,
-        ),
-        description=(
-            "Returns translated Shipping Method fields " "for the given language code."
-        ),
-        resolver=resolve_translation,
+    translation = TranslationField(
+        ShippingMethodTranslation, type_name="shipping method"
     )
 
     class Meta:
-        description = """
-            Shipping method are the methods you'll use to get
-            customer's orders to them.
-            They are directly exposed to the customers."""
+        description = (
+            "Shipping method are the methods you'll use to get customer's orders to "
+            "them. They are directly exposed to the customers."
+        )
         model = models.ShippingMethod
         interfaces = [relay.Node]
         only_fields = [
@@ -61,12 +54,16 @@ class ShippingZone(CountableDjangoObjectType):
         ),
         model_field="shipping_methods",
     )
+    warehouses = graphene.List(
+        Warehouse, description="List of warehouses for shipping zone."
+    )
 
     class Meta:
-        description = """
-            Represents a shipping zone in the shop. Zones are the concept
-            used only for grouping shipping methods in the dashboard,
-            and are never exposed to the customers directly."""
+        description = (
+            "Represents a shipping zone in the shop. Zones are the concept used only "
+            "for grouping shipping methods in the dashboard, and are never exposed to "
+            "the customers directly."
+        )
         model = models.ShippingZone
         interfaces = [relay.Node]
         only_fields = ["default", "id", "name"]
@@ -85,3 +82,8 @@ class ShippingZone(CountableDjangoObjectType):
     @staticmethod
     def resolve_shipping_methods(root: models.ShippingZone, *_args):
         return root.shipping_methods.all()
+
+    @staticmethod
+    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
+    def resolve_warehouses(root: models.ShippingZone, *_args):
+        return root.warehouses.all()

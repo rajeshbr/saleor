@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 import django_filters
 import graphene
 import pytest
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.utils import timezone
 from graphene import InputField
 from graphql_jwt.shortcuts import get_token
@@ -12,10 +12,18 @@ from saleor.graphql.core.enums import ReportingPeriod
 from saleor.graphql.core.filters import EnumFilter
 from saleor.graphql.core.mutations import BaseMutation
 from saleor.graphql.core.types import FilterInputObjectType
-from saleor.graphql.core.utils import clean_seo_fields, snake_to_camel_case
+from saleor.graphql.core.utils import (
+    clean_seo_fields,
+    snake_to_camel_case,
+    validate_slug_and_generate_if_needed,
+)
 from saleor.graphql.product import types as product_types
-from saleor.graphql.utils import get_database_id, reporting_period_to_date
-from saleor.product.models import Product
+from saleor.graphql.utils import (
+    filter_range_field,
+    get_database_id,
+    reporting_period_to_date,
+)
+from saleor.product.models import Category, Product
 from tests.api.utils import _get_graphql_content_from_response, get_graphql_content
 
 
@@ -97,8 +105,9 @@ def test_mutation_returns_error_field_in_camel_case(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)
-    error = content["data"]["productVariantUpdate"]["errors"][0]
-    assert error["field"] == "costPrice"
+    errors = content["data"]["productVariantUpdate"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["field"] == "costPriceAmount"
 
 
 def test_reporting_period_to_date():
@@ -153,7 +162,9 @@ def test_total_count_query(api_client, product):
     assert content["data"]["products"]["totalCount"] == Product.objects.count()
 
 
-def test_mutation_decimal_input(staff_api_client, variant, permission_manage_products):
+def test_mutation_decimal_input(
+    staff_api_client, variant, stock, permission_manage_products
+):
     query = """
     mutation decimalInput($id: ID!, $cost: Decimal) {
         productVariantUpdate(id: $id,
@@ -173,6 +184,7 @@ def test_mutation_decimal_input(staff_api_client, variant, permission_manage_pro
     variables = {
         "id": graphene.Node.to_global_id("ProductVariant", variant.id),
         "cost": 12.12,
+        "quantity": 17,
     }
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_products]
@@ -300,3 +312,62 @@ def test_verify_token_incorrect_token(api_client):
     response = api_client.post_graphql(MUTATION_TOKEN_VERIFY, variables)
     content = get_graphql_content(response)
     assert not content["data"]["tokenVerify"]
+
+
+@pytest.mark.parametrize(
+    "cleaned_input",
+    [
+        {"slug": None, "name": "test"},
+        {"slug": "", "name": "test"},
+        {"slug": ""},
+        {"slug": None},
+    ],
+)
+def test_validate_slug_and_generate_if_needed_raises_errors(category, cleaned_input):
+    with pytest.raises(ValidationError):
+        validate_slug_and_generate_if_needed(category, "name", cleaned_input)
+
+
+@pytest.mark.parametrize(
+    "cleaned_input", [{"slug": "test-slug"}, {"slug": "test-slug", "name": "test"}]
+)
+def test_validate_slug_and_generate_if_needed_not_raises_errors(
+    category, cleaned_input
+):
+    validate_slug_and_generate_if_needed(category, "name", cleaned_input)
+
+
+@pytest.mark.parametrize(
+    "cleaned_input",
+    [
+        {"slug": None, "name": "test"},
+        {"slug": "", "name": "test"},
+        {"slug": ""},
+        {"slug": None},
+        {"slug": "test-slug"},
+        {"slug": "test-slug", "name": "test"},
+    ],
+)
+def test_validate_slug_and_generate_if_needed_generate_slug(cleaned_input):
+    category = Category(name="test")
+    validate_slug_and_generate_if_needed(category, "name", cleaned_input)
+
+
+@pytest.mark.parametrize(
+    "value, count, product_indexes",
+    [
+        ({"lte": 50, "gte": 25}, 1, [2]),
+        ({"lte": 25}, 2, [0, 1]),
+        ({"lte": 10}, 1, [0]),
+        ({"gte": 40}, 0, []),
+    ],
+)
+def test_filter_range_field(value, count, product_indexes, product_list):
+    qs = Product.objects.all().order_by("pk")
+    field = "price_amount"
+
+    result = filter_range_field(qs, field, value)
+
+    expected_products = [qs[index] for index in product_indexes]
+    assert result.count() == count
+    assert list(result) == expected_products

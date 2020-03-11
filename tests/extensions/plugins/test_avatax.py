@@ -1,6 +1,7 @@
 from unittest.mock import Mock
 
 import pytest
+from django.core.exceptions import ValidationError
 from prices import Money, TaxedMoney
 
 from saleor.checkout.utils import add_variant_to_checkout
@@ -18,9 +19,11 @@ from saleor.extensions.plugins.avatax.plugin import AvataxPlugin
 
 @pytest.fixture
 def plugin_configuration(db):
-    plugin_configuration = PluginConfiguration.objects.create(
-        **AvataxPlugin._get_default_configuration()
-    )
+    default_configuration = AvataxPlugin._get_default_configuration()
+    for elem in default_configuration["configuration"]:
+        if elem["name"] == "Use sandbox":
+            elem["value"] = False
+    plugin_configuration = PluginConfiguration.objects.create(**default_configuration)
     config = [
         {"name": "Username or account", "value": "2000134479"},
         {"name": "Password or license", "value": "697932CFCBDE505B"},
@@ -122,7 +125,7 @@ def test_calculate_checkout_total(
 
     voucher_amount = Money(voucher_amount, "USD")
     checkout_with_item.shipping_method = shipping_zone.shipping_methods.get()
-    checkout_with_item.discount_amount = voucher_amount
+    checkout_with_item.discount = voucher_amount
     checkout_with_item.save()
     line = checkout_with_item.lines.first()
     product = line.variant.product
@@ -188,7 +191,7 @@ def test_calculate_checkout_subtotal(
     taxes_in_prices,
     discount_info,
     checkout_with_item,
-    variant,
+    stock,
     monkeypatch,
     site_settings,
     address_usa,
@@ -196,6 +199,7 @@ def test_calculate_checkout_subtotal(
     address,
     settings,
 ):
+    variant = stock.product_variant
     settings.AVATAX_USERNAME_OR_ACCOUNT = "test"
     settings.AVATAX_PASSWORD_OR_LICENSE = "test"
     settings.PLUGINS = ["saleor.extensions.plugins.avatax.plugin.AvataxPlugin"]
@@ -385,18 +389,26 @@ def test_save_plugin_configuration(settings):
     settings.PLUGINS = ["saleor.extensions.plugins.avatax.plugin.AvataxPlugin"]
     manager = get_extensions_manager()
     configuration = manager.get_plugin_configuration("Avalara")
+    manager.save_plugin_configuration(
+        "Avalara",
+        {
+            "configuration": [
+                {"name": "Username or account", "value": "test"},
+                {"name": "Password or license", "value": "test"},
+            ]
+        },
+    )
     manager.save_plugin_configuration("Avalara", {"active": True})
-
     configuration.refresh_from_db()
     assert configuration.active
 
 
-def test_taxes_are_enabled(settings):
+def test_save_plugin_configuration_cannot_be_enabled_without_config(settings):
     settings.PLUGINS = ["saleor.extensions.plugins.avatax.plugin.AvataxPlugin"]
-    settings.AVATAX_USERNAME_OR_ACCOUNT = "test"
-    settings.AVATAX_PASSWORD_OR_LICENSE = "test"
     manager = get_extensions_manager()
-    assert manager.taxes_are_enabled() is True
+    manager.get_plugin_configuration("Avalara")
+    with pytest.raises(ValidationError):
+        manager.save_plugin_configuration("Avalara", {"active": True})
 
 
 def test_show_taxes_on_storefront(settings):
@@ -407,7 +419,7 @@ def test_show_taxes_on_storefront(settings):
     assert manager.show_taxes_on_storefront() is False
 
 
-def test_postprocess_order_creation(settings, order, monkeypatch):
+def test_order_created(settings, order, monkeypatch):
     settings.PLUGINS = ["saleor.extensions.plugins.avatax.plugin.AvataxPlugin"]
     settings.AVATAX_USERNAME_OR_ACCOUNT = "test"
     settings.AVATAX_PASSWORD_OR_LICENSE = "test"
@@ -422,7 +434,7 @@ def test_postprocess_order_creation(settings, order, monkeypatch):
         mocked_task,
     )
 
-    manager.postprocess_order_creation(order)
+    manager.order_created(order)
 
     assert mocked_task.called
 

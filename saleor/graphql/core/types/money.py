@@ -1,5 +1,5 @@
 import graphene
-from django_prices.templatetags import prices_i18n
+from django_prices.templatetags import prices
 
 from ..enums import TaxRateType
 
@@ -8,7 +8,11 @@ class Money(graphene.ObjectType):
     currency = graphene.String(description="Currency code.", required=True)
     amount = graphene.Float(description="Amount of money.", required=True)
     localized = graphene.String(
-        description="Money formatted according to the current locale.", required=True
+        description="Money formatted according to the current locale.",
+        required=True,
+        deprecation_reason="DEPRECATED: Will be removed in Saleor 2.11. "
+        "Price formatting according to the current locale should be "
+        "handled by the frontend client.",
     )
 
     class Meta:
@@ -16,7 +20,7 @@ class Money(graphene.ObjectType):
 
     @staticmethod
     def resolve_localized(root, _info):
-        return prices_i18n.amount(root)
+        return prices.amount(root)
 
 
 class MoneyRange(graphene.ObjectType):
@@ -38,9 +42,10 @@ class TaxedMoney(graphene.ObjectType):
     tax = graphene.Field(Money, description="Amount of taxes.", required=True)
 
     class Meta:
-        description = """Represents a monetary value with taxes. In
-        case when taxes were not applied, net and gross values will be equal.
-        """
+        description = (
+            "Represents a monetary value with taxes. In cases where taxes were not "
+            "applied, net and gross values will be equal."
+        )
 
 
 class TaxedMoneyRange(graphene.ObjectType):

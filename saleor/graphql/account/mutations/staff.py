@@ -6,24 +6,21 @@ from graphql_jwt.decorators import staff_member_required
 from graphql_jwt.exceptions import PermissionDenied
 
 from ....account import events as account_events, models, utils
+from ....account.emails import send_set_password_email_with_url
+from ....account.error_codes import AccountErrorCode
 from ....account.thumbnails import create_user_avatar_thumbnails
-from ....account.utils import get_random_avatar
+from ....account.utils import get_random_avatar, remove_staff_member
 from ....checkout import AddressType
-from ....core.permissions import get_permissions
-from ....dashboard.emails import send_set_password_staff_email
-from ....dashboard.staff.utils import remove_staff_member
+from ....core.permissions import AccountPermissions, get_permissions
+from ....core.utils.url import validate_storefront_url
 from ...account.enums import AddressTypeEnum
 from ...account.types import Address, AddressInput, User
 from ...core.enums import PermissionEnum
-from ...core.mutations import (
-    BaseMutation,
-    ClearMetaBaseMutation,
-    ModelDeleteMutation,
-    ModelMutation,
-    UpdateMetaBaseMutation,
-)
+from ...core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
 from ...core.types import Upload
+from ...core.types.common import AccountError
 from ...core.utils import validate_image_file
+from ...meta.deprecated.mutations import ClearMetaBaseMutation, UpdateMetaBaseMutation
 from ..utils import CustomerDeleteMixin, StaffDeleteMixin, UserDeleteMixin
 from .base import (
     BaseAddressDelete,
@@ -42,8 +39,11 @@ class StaffInput(UserInput):
 
 
 class StaffCreateInput(StaffInput):
-    send_password_email = graphene.Boolean(
-        description="Send an email with a link to set the password"
+    redirect_url = graphene.String(
+        description=(
+            "URL of a view where users should be redirected to "
+            "set the password. URL in RFC 1808 format."
+        )
     )
 
 
@@ -52,7 +52,9 @@ class CustomerCreate(BaseCustomerCreate):
         description = "Creates a new customer."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
 
 class CustomerUpdate(CustomerCreate):
@@ -66,7 +68,9 @@ class CustomerUpdate(CustomerCreate):
         description = "Updates an existing customer."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     @classmethod
     def generate_events(
@@ -107,7 +111,7 @@ class CustomerUpdate(CustomerCreate):
         new_instance = cls.construct_instance(copy(original_instance), cleaned_input)
 
         # Save the new instance data
-        cls.clean_instance(new_instance)
+        cls.clean_instance(info, new_instance)
         cls.save(info, new_instance, cleaned_input)
         cls._save_m2m(info, new_instance, cleaned_input)
 
@@ -127,7 +131,9 @@ class CustomerDelete(CustomerDeleteMixin, UserDelete):
     class Meta:
         description = "Deletes a customer."
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of a customer to delete.")
@@ -149,11 +155,21 @@ class StaffCreate(ModelMutation):
         description = "Creates a new staff user."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_staff",)
+        permissions = (AccountPermissions.MANAGE_STAFF,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     @classmethod
     def clean_input(cls, info, instance, data):
         cleaned_input = super().clean_input(info, instance, data)
+
+        if cleaned_input.get("redirect_url"):
+            try:
+                validate_storefront_url(cleaned_input.get("redirect_url"))
+            except ValidationError as error:
+                raise ValidationError(
+                    {"redirect_url": error}, code=AccountErrorCode.INVALID
+                )
 
         # set is_staff to True to create a staff user
         cleaned_input["is_staff"] = True
@@ -172,8 +188,10 @@ class StaffCreate(ModelMutation):
         user.save()
         if create_avatar:
             create_user_avatar_thumbnails.delay(user_id=user.pk)
-        if cleaned_input.get("send_password_email"):
-            send_set_password_staff_email.delay(user.pk)
+        if cleaned_input.get("redirect_url"):
+            send_set_password_email_with_url(
+                redirect_url=cleaned_input.get("redirect_url"), user=user, staff=True
+            )
 
 
 class StaffUpdate(StaffCreate):
@@ -187,18 +205,30 @@ class StaffUpdate(StaffCreate):
         description = "Updates an existing staff user."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_staff",)
+        permissions = (AccountPermissions.MANAGE_STAFF,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     @classmethod
     def clean_is_active(cls, is_active, instance, user):
         if not is_active:
             if user == instance:
                 raise ValidationError(
-                    {"is_active": "Cannot deactivate your own account."}
+                    {
+                        "is_active": ValidationError(
+                            "Cannot deactivate your own account.",
+                            code=AccountErrorCode.DEACTIVATE_OWN_ACCOUNT,
+                        )
+                    }
                 )
             elif instance.is_superuser:
                 raise ValidationError(
-                    {"is_active": "Cannot deactivate superuser's account."}
+                    {
+                        "is_active": ValidationError(
+                            "Cannot deactivate superuser's account.",
+                            code=AccountErrorCode.DEACTIVATE_SUPERUSER_ACCOUNT,
+                        )
+                    }
                 )
 
     @classmethod
@@ -214,14 +244,16 @@ class StaffDelete(StaffDeleteMixin, UserDelete):
     class Meta:
         description = "Deletes a staff user."
         model = models.User
-        permissions = ("account.manage_staff",)
+        permissions = (AccountPermissions.MANAGE_STAFF,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of a staff user to delete.")
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
-        if not cls.check_permissions(info.context.user):
+        if not cls.check_permissions(info.context):
             raise PermissionDenied()
 
         user_id = data.get("id")
@@ -243,16 +275,18 @@ class AddressCreate(ModelMutation):
 
     class Arguments:
         user_id = graphene.ID(
-            description="ID of a user to create address for", required=True
+            description="ID of a user to create address for.", required=True
         )
         input = AddressInput(
-            description="Fields required to create address", required=True
+            description="Fields required to create address.", required=True
         )
 
     class Meta:
-        description = "Creates user address"
+        description = "Creates user address."
         model = models.Address
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     @classmethod
     def perform_mutation(cls, root, info, **data):
@@ -260,23 +294,30 @@ class AddressCreate(ModelMutation):
         user = cls.get_node_or_error(info, user_id, field="user_id", only_type=User)
         response = super().perform_mutation(root, info, **data)
         if not response.errors:
-            user.addresses.add(response.address)
+            address = info.context.extensions.change_user_address(
+                response.address, None, user
+            )
+            user.addresses.add(address)
             response.user = user
         return response
 
 
 class AddressUpdate(BaseAddressUpdate):
     class Meta:
-        description = "Updates an address"
+        description = "Updates an address."
         model = models.Address
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
 
 class AddressDelete(BaseAddressDelete):
     class Meta:
-        description = "Deletes an address"
+        description = "Deletes an address."
         model = models.Address
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
 
 class AddressSetDefault(BaseMutation):
@@ -291,7 +332,9 @@ class AddressSetDefault(BaseMutation):
 
     class Meta:
         description = "Sets a default address for the given user."
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, address_id, user_id, **data):
@@ -302,7 +345,12 @@ class AddressSetDefault(BaseMutation):
 
         if not user.addresses.filter(pk=address.pk).exists():
             raise ValidationError(
-                {"address_id": "The address doesn't belong to that user."}
+                {
+                    "address_id": ValidationError(
+                        "The address doesn't belong to that user.",
+                        code=AccountErrorCode.INVALID,
+                    )
+                }
             )
 
         if data.get("type") == AddressTypeEnum.BILLING.value:
@@ -324,12 +372,13 @@ class UserAvatarUpdate(BaseMutation):
         )
 
     class Meta:
-        description = """
-            Create a user avatar. Only for staff members. This mutation must
-            be sent as a `multipart` request. More detailed specs of the
-            upload format can be found here:
-            https://github.com/jaydenseric/graphql-multipart-request-spec
-            """
+        description = (
+            "Create a user avatar. Only for staff members. This mutation must be sent "
+            "as a `multipart` request. More detailed specs of the upload format can be "
+            "found here: https://github.com/jaydenseric/graphql-multipart-request-spec"
+        )
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     @classmethod
     @staff_member_required
@@ -353,6 +402,8 @@ class UserAvatarDelete(BaseMutation):
 
     class Meta:
         description = "Deletes a user avatar. Only for staff members."
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
     @classmethod
     @staff_member_required
@@ -366,14 +417,18 @@ class UserAvatarDelete(BaseMutation):
 class UserUpdatePrivateMeta(UpdateMetaBaseMutation):
     class Meta:
         description = "Updates private metadata for user."
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         model = models.User
         public = False
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
 
-class UserClearStoredPrivateMeta(ClearMetaBaseMutation):
+class UserClearPrivateMeta(ClearMetaBaseMutation):
     class Meta:
-        description = "Clear stored metadata value."
+        description = "Clear private metadata for user."
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         public = False
+        error_type_class = AccountError
+        error_type_field = "account_errors"
